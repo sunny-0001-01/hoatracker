@@ -1,0 +1,2198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HOAShield — Track, Dispute & Win</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<!--
+=============================================================
+  CLOUDFLARE D1 DATABASE SCHEMA
+  Run these in your D1 dashboard or via wrangler CLI:
+  wrangler d1 execute hoashield-db --file=schema.sql
+=============================================================
+
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  plan TEXT DEFAULT 'free',
+  state TEXT,
+  stripe_customer_id TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS violations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  type TEXT NOT NULL,
+  date_received TEXT NOT NULL,
+  deadline TEXT,
+  fine_amount REAL DEFAULT 0,
+  status TEXT DEFAULT 'open',
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS photos (
+  id TEXT PRIMARY KEY,
+  violation_id TEXT NOT NULL,
+  data TEXT NOT NULL,
+  caption TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(violation_id) REFERENCES violations(id)
+);
+
+CREATE TABLE IF NOT EXISTS disputes (
+  id TEXT PRIMARY KEY,
+  violation_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  submitted_date TEXT,
+  board_response TEXT,
+  next_hearing TEXT,
+  status TEXT DEFAULT 'pending',
+  outcome TEXT,
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(violation_id) REFERENCES violations(id)
+);
+
+CREATE TABLE IF NOT EXISTS letters (
+  id TEXT PRIMARY KEY,
+  violation_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  template_type TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(violation_id) REFERENCES violations(id)
+);
+
+-- Cloudflare Worker endpoint stubs (add in /functions/ folder):
+-- POST /api/auth/register  → create user, return JWT stored in localStorage
+-- POST /api/auth/login     → verify, return JWT
+-- GET  /api/violations     → list user violations (auth'd)
+-- POST /api/violations     → create violation
+-- PUT  /api/violations/:id → update violation
+-- DELETE /api/violations/:id
+-- POST /api/stripe/checkout → create Stripe checkout session
+-- POST /api/stripe/webhook  → handle paid event, upgrade user.plan to 'paid'
+
+-- NOTE FOR MVP: All data stored in localStorage until you wire up D1.
+-- Schema above is ready for when you deploy Workers.
+=============================================================
+-->
+
+<style>
+  :root {
+    --bg: #F7F5F0;
+    --bg2: #EDEAE3;
+    --bg3: #E3DFD6;
+    --card: #FFFFFF;
+    --ink: #1A1814;
+    --ink2: #5C5850;
+    --ink3: #9C9588;
+    --accent: #C8410A;
+    --accent2: #E8622E;
+    --accent-bg: #FDF0EB;
+    --green: #1A6B4A;
+    --green-bg: #EAF5EF;
+    --amber: #92520A;
+    --amber-bg: #FDF3E3;
+    --red: #B91C1C;
+    --red-bg: #FEF2F2;
+    --border: #D8D4CC;
+    --border2: #EAE6DF;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --shadow: 0 1px 3px rgba(26,24,20,0.08), 0 4px 16px rgba(26,24,20,0.04);
+    --shadow-lg: 0 8px 32px rgba(26,24,20,0.12);
+    --serif: 'Instrument Serif', Georgia, serif;
+    --sans: 'DM Sans', system-ui, sans-serif;
+    --stripe-key: 'pk_test_REPLACE_WITH_YOUR_STRIPE_KEY';
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    font-size: 15px;
+    line-height: 1.6;
+  }
+
+  /* ── LAYOUT ── */
+  #app { display: flex; min-height: 100vh; }
+
+  /* ── SIDEBAR ── */
+  #sidebar {
+    width: 240px;
+    min-height: 100vh;
+    background: var(--card);
+    border-right: 1px solid var(--border2);
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    left: 0; top: 0; bottom: 0;
+    z-index: 100;
+    transition: transform .25s ease;
+  }
+
+  .sidebar-logo {
+    padding: 24px 20px 20px;
+    border-bottom: 1px solid var(--border2);
+  }
+  .logo-mark {
+    font-family: var(--serif);
+    font-size: 22px;
+    color: var(--ink);
+    letter-spacing: -0.3px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .logo-shield {
+    width: 28px; height: 28px;
+    background: var(--accent);
+    border-radius: 6px 6px 12px 12px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .logo-shield svg { width: 16px; height: 16px; fill: white; }
+  .logo-sub { font-size: 11px; color: var(--ink3); margin-top: 2px; font-weight: 300; letter-spacing: 0.3px; }
+
+  .sidebar-nav { flex: 1; padding: 12px 10px; overflow-y: auto; }
+
+  .nav-section-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--ink3);
+    padding: 14px 10px 6px;
+  }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 400;
+    color: var(--ink2);
+    transition: all .15s;
+    margin-bottom: 2px;
+    user-select: none;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+  }
+  .nav-item:hover { background: var(--bg); color: var(--ink); }
+  .nav-item.active { background: var(--accent-bg); color: var(--accent); font-weight: 500; }
+  .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; opacity: .7; }
+  .nav-item.active svg { opacity: 1; }
+  .nav-badge {
+    margin-left: auto;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 10px;
+    background: var(--accent);
+    color: white;
+  }
+
+  .sidebar-footer {
+    padding: 16px;
+    border-top: 1px solid var(--border2);
+  }
+  .plan-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    font-size: 13px;
+  }
+  .plan-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink3); flex-shrink: 0; }
+  .plan-dot.paid { background: var(--green); }
+  .plan-name { font-weight: 500; }
+  .plan-label { font-size: 11px; color: var(--ink3); }
+  .upgrade-btn {
+    margin-top: 8px;
+    width: 100%;
+    padding: 9px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .upgrade-btn:hover { background: var(--accent2); }
+  .upgrade-btn.hidden { display: none; }
+
+  /* ── MAIN ── */
+  #main {
+    margin-left: 240px;
+    flex: 1;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── TOP BAR ── */
+  .topbar {
+    height: 60px;
+    padding: 0 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border2);
+    background: var(--card);
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+  .topbar-title {
+    font-family: var(--serif);
+    font-size: 20px;
+    color: var(--ink);
+  }
+  .topbar-actions { display: flex; gap: 8px; align-items: center; }
+
+  /* ── BUTTONS ── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: var(--radius-sm);
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: none;
+    transition: all .15s;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .btn svg { width: 14px; height: 14px; }
+  .btn-primary { background: var(--accent); color: white; }
+  .btn-primary:hover { background: var(--accent2); }
+  .btn-secondary { background: var(--bg2); color: var(--ink2); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: var(--bg3); color: var(--ink); }
+  .btn-ghost { background: transparent; color: var(--ink2); padding: 8px 10px; }
+  .btn-ghost:hover { background: var(--bg2); }
+  .btn-danger { background: var(--red-bg); color: var(--red); border: 1px solid #FCA5A5; }
+  .btn-danger:hover { background: #FEE2E2; }
+  .btn-sm { padding: 5px 11px; font-size: 12px; }
+  .btn-icon { padding: 7px; }
+
+  /* ── PAGE CONTENT ── */
+  .page { display: none; padding: 28px; max-width: 900px; }
+  .page.active { display: block; }
+
+  /* ── STATS ROW ── */
+  .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border2);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    position: relative;
+    overflow: hidden;
+  }
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: var(--border2);
+  }
+  .stat-card.danger::before { background: var(--accent); }
+  .stat-card.warn::before { background: #F59E0B; }
+  .stat-card.good::before { background: var(--green); }
+  .stat-num { font-family: var(--serif); font-size: 32px; line-height: 1; color: var(--ink); margin-bottom: 4px; }
+  .stat-label { font-size: 12px; color: var(--ink3); font-weight: 400; }
+
+  /* ── CARDS ── */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border2);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow);
+  }
+  .card-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border2);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .card-title { font-size: 14px; font-weight: 500; color: var(--ink); }
+  .card-body { padding: 20px; }
+
+  /* ── VIOLATION LIST ── */
+  .violation-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 16px 0;
+    border-bottom: 1px solid var(--border2);
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .violation-item:last-child { border-bottom: none; }
+  .violation-item:hover { opacity: .85; }
+  .v-status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    margin-top: 5px;
+    flex-shrink: 0;
+  }
+  .v-status-dot.open { background: var(--accent); }
+  .v-status-dot.disputed { background: #F59E0B; }
+  .v-status-dot.resolved { background: var(--green); }
+  .v-body { flex: 1; min-width: 0; }
+  .v-title { font-weight: 500; font-size: 14px; color: var(--ink); margin-bottom: 3px; }
+  .v-meta { font-size: 12px; color: var(--ink3); display: flex; gap: 12px; flex-wrap: wrap; }
+  .v-fine { font-weight: 500; color: var(--accent); }
+  .v-right { text-align: right; flex-shrink: 0; }
+  .deadline-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 3px 8px;
+    border-radius: 20px;
+  }
+  .deadline-pill.urgent { background: var(--red-bg); color: var(--red); }
+  .deadline-pill.warn { background: var(--amber-bg); color: var(--amber); }
+  .deadline-pill.ok { background: var(--green-bg); color: var(--green); }
+  .deadline-pill.none { background: var(--bg2); color: var(--ink3); }
+
+  /* ── FORMS ── */
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .form-group { display: flex; flex-direction: column; gap: 5px; }
+  .form-group.full { grid-column: 1 / -1; }
+  label { font-size: 12px; font-weight: 500; color: var(--ink2); }
+  input, select, textarea {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-family: var(--sans);
+    font-size: 14px;
+    color: var(--ink);
+    background: var(--card);
+    transition: border-color .15s;
+    width: 100%;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(200,65,10,0.08);
+  }
+  textarea { min-height: 90px; resize: vertical; line-height: 1.5; }
+  select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239C9588' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; padding-right: 32px; }
+
+  /* ── STATUS BADGES ── */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 3px 9px;
+    border-radius: 20px;
+  }
+  .badge-open { background: var(--accent-bg); color: var(--accent); }
+  .badge-disputed { background: var(--amber-bg); color: var(--amber); }
+  .badge-resolved { background: var(--green-bg); color: var(--green); }
+  .badge-free { background: var(--bg2); color: var(--ink3); }
+  .badge-paid { background: var(--green-bg); color: var(--green); }
+
+  /* ── PHOTO UPLOAD ── */
+  .photo-drop {
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    text-align: center;
+    cursor: pointer;
+    transition: all .2s;
+    background: var(--bg);
+  }
+  .photo-drop:hover { border-color: var(--accent); background: var(--accent-bg); }
+  .photo-drop-icon { font-size: 28px; margin-bottom: 8px; }
+  .photo-drop p { font-size: 13px; color: var(--ink3); }
+  .photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; margin-top: 14px; }
+  .photo-thumb {
+    position: relative;
+    aspect-ratio: 1;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    border: 1px solid var(--border2);
+  }
+  .photo-thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .photo-thumb .remove-photo {
+    position: absolute; top: 4px; right: 4px;
+    width: 20px; height: 20px;
+    background: rgba(26,24,20,0.7);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    font-size: 11px;
+    color: white;
+    border: none;
+  }
+
+  /* ── LETTER TEMPLATES ── */
+  .template-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+  .template-card {
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .template-card:hover { border-color: var(--accent); background: var(--accent-bg); }
+  .template-card.selected { border-color: var(--accent); background: var(--accent-bg); }
+  .template-card h4 { font-size: 13px; font-weight: 500; color: var(--ink); margin-bottom: 3px; }
+  .template-card p { font-size: 11px; color: var(--ink3); line-height: 1.4; }
+
+  .letter-preview {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 24px;
+    font-size: 13px;
+    line-height: 1.8;
+    white-space: pre-wrap;
+    font-family: Georgia, serif;
+    color: var(--ink);
+    min-height: 300px;
+  }
+
+  /* ── STATE LAW REFERENCE ── */
+  .state-law-card {
+    background: var(--card);
+    border: 1px solid var(--border2);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  .state-law-header {
+    padding: 14px 18px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border2);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .state-law-name { font-weight: 500; font-size: 14px; }
+  .law-items { padding: 14px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .law-item { display: flex; gap: 12px; font-size: 13px; }
+  .law-key { font-weight: 500; color: var(--ink2); min-width: 140px; flex-shrink: 0; }
+  .law-val { color: var(--ink); }
+
+  /* ── PAYWALL OVERLAY ── */
+  .paywall-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(26,24,20,0.5);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .paywall-overlay.show { display: flex; }
+  .paywall-modal {
+    background: var(--card);
+    border-radius: 16px;
+    padding: 36px;
+    max-width: 440px;
+    width: 100%;
+    box-shadow: var(--shadow-lg);
+    text-align: center;
+  }
+  .paywall-icon { font-size: 40px; margin-bottom: 16px; }
+  .paywall-title { font-family: var(--serif); font-size: 26px; color: var(--ink); margin-bottom: 10px; }
+  .paywall-sub { font-size: 14px; color: var(--ink2); line-height: 1.6; margin-bottom: 24px; }
+  .paywall-features { text-align: left; margin-bottom: 24px; display: flex; flex-direction: column; gap: 8px; }
+  .paywall-feature { display: flex; gap: 10px; font-size: 13px; color: var(--ink2); align-items: flex-start; }
+  .paywall-feature span:first-child { color: var(--green); font-size: 15px; margin-top: 1px; }
+  .paywall-price { font-family: var(--serif); font-size: 36px; color: var(--accent); margin-bottom: 4px; }
+  .paywall-period { font-size: 12px; color: var(--ink3); margin-bottom: 20px; }
+  .paywall-cta {
+    width: 100%;
+    padding: 14px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s;
+    margin-bottom: 10px;
+  }
+  .paywall-cta:hover { background: var(--accent2); }
+  .paywall-dismiss { background: none; border: none; font-size: 13px; color: var(--ink3); cursor: pointer; font-family: var(--sans); }
+  .paywall-dismiss:hover { color: var(--ink); }
+
+  /* ── MODAL ── */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(26,24,20,0.45);
+    z-index: 200;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 60px 20px;
+    overflow-y: auto;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal {
+    background: var(--card);
+    border-radius: 16px;
+    width: 100%;
+    max-width: 560px;
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+  }
+  .modal-header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border2);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .modal-title { font-family: var(--serif); font-size: 20px; }
+  .modal-close {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: var(--bg2);
+    border: none;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+    color: var(--ink2);
+    transition: background .15s;
+  }
+  .modal-close:hover { background: var(--bg3); }
+  .modal-body { padding: 24px; }
+  .modal-footer { padding: 16px 24px; border-top: 1px solid var(--border2); display: flex; justify-content: flex-end; gap: 10px; }
+
+  /* ── EMPTY STATE ── */
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--ink3);
+  }
+  .empty-state-icon { font-size: 48px; margin-bottom: 16px; opacity: .5; }
+  .empty-state h3 { font-family: var(--serif); font-size: 22px; color: var(--ink2); margin-bottom: 8px; }
+  .empty-state p { font-size: 14px; line-height: 1.6; margin-bottom: 20px; }
+
+  /* ── TOAST ── */
+  #toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: var(--ink);
+    color: white;
+    padding: 12px 18px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-weight: 500;
+    transform: translateY(80px);
+    opacity: 0;
+    transition: all .3s cubic-bezier(.34,1.56,.64,1);
+    z-index: 9999;
+    box-shadow: var(--shadow-lg);
+    max-width: 300px;
+  }
+  #toast.show { transform: translateY(0); opacity: 1; }
+  #toast.success { background: var(--green); }
+  #toast.error { background: var(--red); }
+
+  /* ── FREE LIMIT BAR ── */
+  .limit-bar {
+    background: var(--accent-bg);
+    border: 1px solid #F5C7B0;
+    border-radius: var(--radius-sm);
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 20px;
+    font-size: 13px;
+  }
+  .limit-bar-text { color: var(--accent); flex: 1; }
+  .limit-bar-text strong { font-weight: 600; }
+
+  /* ── RESPONSIVE ── */
+  #mobile-toggle {
+    display: none;
+    position: fixed;
+    top: 14px; left: 14px;
+    z-index: 300;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    cursor: pointer;
+    box-shadow: var(--shadow);
+  }
+
+  @media (max-width: 768px) {
+    #sidebar { transform: translateX(-100%); }
+    #sidebar.open { transform: translateX(0); }
+    #main { margin-left: 0; }
+    #mobile-toggle { display: flex; }
+    .topbar { padding-left: 56px; }
+    .page { padding: 16px; }
+    .stats-row { grid-template-columns: 1fr 1fr; }
+    .form-grid { grid-template-columns: 1fr; }
+    .template-grid { grid-template-columns: 1fr; }
+    .topbar-title { font-size: 17px; }
+  }
+  @media (max-width: 480px) {
+    .stats-row { grid-template-columns: 1fr; }
+  }
+
+  /* ── DIVIDER ── */
+  .divider { height: 1px; background: var(--border2); margin: 20px 0; }
+
+  /* ── SECTION HEADING ── */
+  .section-heading {
+    font-family: var(--serif);
+    font-size: 18px;
+    color: var(--ink);
+    margin-bottom: 4px;
+  }
+  .section-sub { font-size: 13px; color: var(--ink3); margin-bottom: 20px; }
+
+  /* dispute step flow */
+  .dispute-steps { display: flex; gap: 0; margin-bottom: 20px; }
+  .dstep {
+    flex: 1;
+    padding: 10px 14px;
+    font-size: 12px;
+    text-align: center;
+    background: var(--bg2);
+    color: var(--ink3);
+    border: 1px solid var(--border2);
+    border-right: none;
+    font-weight: 500;
+  }
+  .dstep:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+  .dstep:last-child { border-right: 1px solid var(--border2); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+  .dstep.active { background: var(--accent-bg); color: var(--accent); border-color: #F5C7B0; }
+  .dstep.done { background: var(--green-bg); color: var(--green); border-color: #A7DFC2; }
+</style>
+</head>
+<body>
+
+<!-- Mobile sidebar toggle -->
+<button id="mobile-toggle" onclick="toggleSidebar()" aria-label="Menu">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+</button>
+
+<div id="app">
+  <!-- ── SIDEBAR ── -->
+  <nav id="sidebar">
+    <div class="sidebar-logo">
+      <div class="logo-mark">
+        <div class="logo-shield">
+          <svg viewBox="0 0 24 24"><path d="M12 2L3 7v5c0 5.25 3.75 10.15 9 11.25C17.25 22.15 21 17.25 21 12V7L12 2z"/></svg>
+        </div>
+        HOAShield
+      </div>
+      <div class="logo-sub">Your HOA defense system</div>
+    </div>
+
+    <div class="sidebar-nav">
+      <div class="nav-section-label">Overview</div>
+      <button class="nav-item active" onclick="nav('dashboard')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+        Dashboard
+      </button>
+
+      <div class="nav-section-label">My Case</div>
+      <button class="nav-item" onclick="nav('violations')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        Violations
+        <span class="nav-badge" id="nav-violation-count">0</span>
+      </button>
+      <button class="nav-item" onclick="nav('disputes')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+        Disputes
+      </button>
+      <button class="nav-item" onclick="nav('documents')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
+        Documents
+      </button>
+
+      <div class="nav-section-label">Tools</div>
+      <button class="nav-item" onclick="nav('letters')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+        Letter Generator
+        <span style="margin-left:auto;font-size:10px;padding:2px 5px;border-radius:4px;background:var(--accent-bg);color:var(--accent);font-weight:600;">PRO</span>
+      </button>
+      <button class="nav-item" onclick="nav('laws')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1l3 6 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1z"/></svg>
+        State Laws
+      </button>
+      <button class="nav-item" onclick="nav('settings')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        Settings
+      </button>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="plan-badge">
+        <div class="plan-dot" id="plan-dot"></div>
+        <div>
+          <div class="plan-name" id="plan-name">Free Plan</div>
+          <div class="plan-label" id="plan-label">3 violations max</div>
+        </div>
+      </div>
+      <button class="upgrade-btn" id="upgrade-btn" onclick="showPaywall('sidebar')">
+        Upgrade to Pro — $29/mo
+      </button>
+    </div>
+  </nav>
+
+  <!-- ── MAIN CONTENT ── -->
+  <div id="main">
+    <div class="topbar">
+      <div class="topbar-title" id="topbar-title">Dashboard</div>
+      <div class="topbar-actions" id="topbar-actions">
+        <button class="btn btn-primary" onclick="showAddViolation()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Violation
+        </button>
+      </div>
+    </div>
+
+    <!-- ── DASHBOARD PAGE ── -->
+    <div class="page active" id="page-dashboard">
+      <div style="margin-bottom:20px">
+        <h2 class="section-heading" id="greeting">Good morning</h2>
+        <p class="section-sub">Here's your HOA defense status.</p>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat-card danger">
+          <div class="stat-num" id="stat-open">0</div>
+          <div class="stat-label">Open violations</div>
+        </div>
+        <div class="stat-card warn">
+          <div class="stat-num" id="stat-disputed">0</div>
+          <div class="stat-label">In dispute</div>
+        </div>
+        <div class="stat-card good">
+          <div class="stat-num" id="stat-resolved">0</div>
+          <div class="stat-label">Resolved</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-num" id="stat-fines">$0</div>
+          <div class="stat-label">Total fines threatened</div>
+        </div>
+      </div>
+
+      <!-- urgent items -->
+      <div class="card" id="urgent-card">
+        <div class="card-header">
+          <div class="card-title">⚡ Urgent — deadlines approaching</div>
+        </div>
+        <div class="card-body" id="urgent-list">
+          <div class="empty-state" style="padding:20px">
+            <p>No urgent deadlines right now. Stay proactive.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- recent violations -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Recent violations</div>
+          <button class="btn btn-ghost btn-sm" onclick="nav('violations')">View all →</button>
+        </div>
+        <div class="card-body" id="dash-recent" style="padding:0 20px">
+          <div class="empty-state" style="padding:30px 0">
+            <div class="empty-state-icon">🏡</div>
+            <h3>No violations logged yet</h3>
+            <p>When your HOA sends a violation notice, log it here immediately.</p>
+            <button class="btn btn-primary" onclick="showAddViolation()">Log first violation</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── VIOLATIONS PAGE ── -->
+    <div class="page" id="page-violations">
+      <div style="margin-bottom:20px">
+        <h2 class="section-heading">Violations</h2>
+        <p class="section-sub">Every violation your HOA has sent you, in one place.</p>
+      </div>
+
+      <div class="limit-bar" id="free-limit-bar">
+        <div class="limit-bar-text"><strong>Free plan:</strong> You can track up to 3 violations. <span id="limit-text">0 of 3 used.</span></div>
+        <button class="btn btn-primary btn-sm" onclick="showPaywall('limit')">Upgrade for unlimited</button>
+      </div>
+
+      <div id="violations-list">
+        <div class="empty-state">
+          <div class="empty-state-icon">📋</div>
+          <h3>No violations yet</h3>
+          <p>Log your first HOA violation letter. Include the deadline — we'll track it for you.</p>
+          <button class="btn btn-primary" onclick="showAddViolation()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add violation
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── VIOLATION DETAIL PAGE ── -->
+    <div class="page" id="page-violation-detail">
+      <div id="violation-detail-content"></div>
+    </div>
+
+    <!-- ── DISPUTES PAGE ── -->
+    <div class="page" id="page-disputes">
+      <div style="margin-bottom:20px">
+        <h2 class="section-heading">Disputes</h2>
+        <p class="section-sub">Track your formal disputes and board responses.</p>
+      </div>
+      <div id="disputes-list">
+        <div class="empty-state">
+          <div class="empty-state-icon">⚖️</div>
+          <h3>No active disputes</h3>
+          <p>Start a dispute from any violation's detail page after generating your letter.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── DOCUMENTS PAGE ── -->
+    <div class="page" id="page-documents">
+      <div style="margin-bottom:20px">
+        <h2 class="section-heading">Document Vault</h2>
+        <p class="section-sub">All photos and evidence you've attached to violations.</p>
+      </div>
+      <div id="documents-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px">
+        <div class="empty-state" style="grid-column:1/-1">
+          <div class="empty-state-icon">📁</div>
+          <h3>No documents yet</h3>
+          <p>Attach photos to your violations and they'll appear here.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── LETTER GENERATOR PAGE ── -->
+    <div class="page" id="page-letters">
+      <div style="margin-bottom:20px">
+        <h2 class="section-heading">Dispute Letter Generator</h2>
+        <p class="section-sub">Professional letters that have helped homeowners win disputes — free with Pro.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><div class="card-title">Step 1 — Choose a template</div></div>
+        <div class="card-body">
+          <div class="template-grid" id="template-grid">
+            <!-- filled by JS -->
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="letter-form-card" style="display:none">
+        <div class="card-header"><div class="card-title">Step 2 — Your details</div></div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Your full name</label>
+              <input type="text" id="letter-name" placeholder="Jane Smith">
+            </div>
+            <div class="form-group">
+              <label>Your property address</label>
+              <input type="text" id="letter-address" placeholder="123 Oak Lane, Phoenix AZ 85001">
+            </div>
+            <div class="form-group">
+              <label>HOA name</label>
+              <input type="text" id="letter-hoa" placeholder="Sunset Ridge HOA">
+            </div>
+            <div class="form-group">
+              <label>Violation type cited</label>
+              <input type="text" id="letter-violation" placeholder="Lawn height violation">
+            </div>
+            <div class="form-group">
+              <label>Date of violation notice</label>
+              <input type="date" id="letter-date">
+            </div>
+            <div class="form-group">
+              <label>Fine amount (if stated)</label>
+              <input type="text" id="letter-fine" placeholder="$150">
+            </div>
+            <div class="form-group full">
+              <label>Your specific situation (brief)</label>
+              <textarea id="letter-situation" placeholder="The violation notice cited overgrown lawn but my lawn was professionally maintained on March 5th. I have photos and a receipt from Green Thumb Landscaping."></textarea>
+            </div>
+          </div>
+          <button class="btn btn-primary" onclick="generateLetter()" style="margin-top:4px">Generate letter →</button>
+        </div>
+      </div>
+
+      <div class="card" id="letter-output-card" style="display:none">
+        <div class="card-header">
+          <div class="card-title">Step 3 — Your letter</div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-secondary btn-sm" onclick="copyLetter()">Copy text</button>
+            <button class="btn btn-primary btn-sm" onclick="downloadLetterPDF()">Download PDF</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="letter-preview" id="letter-preview"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── STATE LAWS PAGE ── -->
+    <div class="page" id="page-laws">
+      <div style="margin-bottom:20px">
+        <h2 class="section-heading">State HOA Laws</h2>
+        <p class="section-sub">Key protections for homeowners by state. Not legal advice — consult an attorney for your situation.</p>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-body" style="padding:14px 20px">
+          <div class="form-group">
+            <label>Filter by state</label>
+            <select id="law-state-filter" onchange="renderLaws()">
+              <option value="">All states</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div id="laws-list"></div>
+    </div>
+
+    <!-- ── SETTINGS PAGE ── -->
+    <div class="page" id="page-settings">
+      <div style="margin-bottom:20px">
+        <h2 class="section-heading">Settings</h2>
+        <p class="section-sub">Your account and preferences.</p>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header"><div class="card-title">Your profile</div></div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Your name</label>
+              <input type="text" id="setting-name" placeholder="Jane Smith">
+            </div>
+            <div class="form-group">
+              <label>Your state</label>
+              <select id="setting-state">
+                <option value="">Select state…</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>HOA name</label>
+              <input type="text" id="setting-hoa" placeholder="Sunset Ridge HOA">
+            </div>
+            <div class="form-group">
+              <label>Property address</label>
+              <input type="text" id="setting-address" placeholder="123 Oak Lane">
+            </div>
+          </div>
+          <button class="btn btn-primary" onclick="saveSettings()" style="margin-top:14px">Save settings</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-header"><div class="card-title">Plan & billing</div></div>
+        <div class="card-body">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+            <div>
+              <div style="font-size:15px;font-weight:500;margin-bottom:4px">Current plan: <span id="settings-plan-name" style="color:var(--accent)">Free</span></div>
+              <div style="font-size:13px;color:var(--ink3)" id="settings-plan-desc">Track up to 3 violations. Upgrade for unlimited access.</div>
+            </div>
+            <button class="btn btn-primary" id="settings-upgrade-btn" onclick="showPaywall('settings')">Upgrade to Pro — $29/mo</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><div class="card-title">Data</div></div>
+        <div class="card-body">
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn btn-secondary" onclick="exportData()">Export all data (JSON)</button>
+            <button class="btn btn-danger" onclick="confirmClearData()">Clear all data</button>
+          </div>
+          <p style="font-size:12px;color:var(--ink3);margin-top:10px">Your data is stored locally in your browser. Export regularly as a backup.</p>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<!-- ── ADD VIOLATION MODAL ── -->
+<div class="modal-overlay" id="modal-add-violation">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">Log a violation</div>
+      <button class="modal-close" onclick="closeModal('modal-add-violation')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="form-group full">
+          <label>Violation title *</label>
+          <input type="text" id="v-title" placeholder="e.g. Lawn height violation notice">
+        </div>
+        <div class="form-group">
+          <label>Violation type *</label>
+          <select id="v-type">
+            <option value="">Select type…</option>
+            <option value="Lawn / landscaping">Lawn / landscaping</option>
+            <option value="Parking">Parking</option>
+            <option value="Architectural / exterior">Architectural / exterior</option>
+            <option value="Noise">Noise</option>
+            <option value="Pet">Pet</option>
+            <option value="Trash / recycling">Trash / recycling</option>
+            <option value="Holiday / seasonal">Holiday / seasonal</option>
+            <option value="Rental / occupancy">Rental / occupancy</option>
+            <option value="Pool / amenity">Pool / amenity</option>
+            <option value="Other">Other</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Fine amount ($)</label>
+          <input type="number" id="v-fine" placeholder="0" min="0" step="0.01">
+        </div>
+        <div class="form-group">
+          <label>Date received *</label>
+          <input type="date" id="v-date">
+        </div>
+        <div class="form-group">
+          <label>Response deadline</label>
+          <input type="date" id="v-deadline">
+        </div>
+        <div class="form-group full">
+          <label>Notes (what happened, what you believe is incorrect)</label>
+          <textarea id="v-notes" placeholder="Describe the situation in your own words. The more detail, the better."></textarea>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('modal-add-violation')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveViolation()">Save violation</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── ADD DISPUTE MODAL ── -->
+<div class="modal-overlay" id="modal-add-dispute">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title">Open a dispute</div>
+      <button class="modal-close" onclick="closeModal('modal-add-dispute')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Date submitted to HOA</label>
+          <input type="date" id="d-submitted">
+        </div>
+        <div class="form-group">
+          <label>HOA board response date</label>
+          <input type="date" id="d-response">
+        </div>
+        <div class="form-group">
+          <label>Next hearing date (if any)</label>
+          <input type="date" id="d-hearing">
+        </div>
+        <div class="form-group">
+          <label>Current status</label>
+          <select id="d-status">
+            <option value="pending">Pending — awaiting response</option>
+            <option value="hearing_scheduled">Hearing scheduled</option>
+            <option value="board_responded">Board responded</option>
+            <option value="escalated">Escalated to attorney</option>
+            <option value="won">Won — dismissed</option>
+            <option value="lost">Lost — fine upheld</option>
+          </select>
+        </div>
+        <div class="form-group full">
+          <label>Notes on dispute progress</label>
+          <textarea id="d-notes" placeholder="What has happened so far? Any verbal conversations, HOA responses, etc."></textarea>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('modal-add-dispute')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveDispute()">Save dispute</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── PAYWALL OVERLAY ── -->
+<div class="paywall-overlay" id="paywall">
+  <div class="paywall-modal">
+    <div class="paywall-icon">🛡️</div>
+    <div class="paywall-title">Your free trial is up</div>
+    <div class="paywall-sub" id="paywall-message">You've used your one free try. Upgrade to Pro for unlimited access to every feature.</div>
+    <div class="paywall-features">
+      <div class="paywall-feature"><span>✓</span><span>Unlimited violation tracking</span></div>
+      <div class="paywall-feature"><span>✓</span><span>Dispute letter generator (10 templates)</span></div>
+      <div class="paywall-feature"><span>✓</span><span>One-click PDF export for attorneys & hearings</span></div>
+      <div class="paywall-feature"><span>✓</span><span>Unlimited photo evidence vault</span></div>
+      <div class="paywall-feature"><span>✓</span><span>Full dispute tracker & outcome history</span></div>
+      <div class="paywall-feature"><span>✓</span><span>Priority state law reference</span></div>
+    </div>
+    <div class="paywall-price">$29</div>
+    <div class="paywall-period">per month — cancel anytime</div>
+    <button class="paywall-cta" onclick="startCheckout()">Start Pro — $29/month</button>
+    <button class="paywall-dismiss" onclick="closePaywall()">Maybe later</button>
+  </div>
+</div>
+
+<!-- ── TOAST ── -->
+<div id="toast"></div>
+
+<script>
+// ════════════════════════════════════════════════
+//   HOAShield MVP — Complete App Logic
+//   Stack: Vanilla JS + localStorage
+//   Payments: Stripe Checkout (replace key below)
+//   DB: localStorage now → Cloudflare D1 later
+// ════════════════════════════════════════════════
+
+const STRIPE_KEY = 'pk_test_REPLACE_WITH_YOUR_STRIPE_KEY';
+const STRIPE_PRICE_ID = 'price_REPLACE_WITH_YOUR_PRICE_ID';
+
+// ── TRIAL LOGIC ──
+// Each gated feature gets ONE free use. After that → paywall.
+// Tracked in localStorage under 'hoas_trials'.
+// Keys: 'violation', 'letter', 'pdf', 'dispute', 'photo_extra'
+const TRIAL_FEATURES = ['violation', 'letter', 'pdf', 'dispute', 'photo_extra'];
+
+function getTrials() {
+  return JSON.parse(localStorage.getItem('hoas_trials') || '{}');
+}
+function hasUsedTrial(feature) {
+  return !!getTrials()[feature];
+}
+function consumeTrial(feature) {
+  const t = getTrials();
+  t[feature] = true;
+  localStorage.setItem('hoas_trials', JSON.stringify(t));
+}
+// Returns true if the action should proceed (either paid OR first free use)
+// Shows paywall and returns false on second+ attempt
+function gateFeature(feature, paywallTrigger) {
+  if (isPaid()) return true;
+  if (!hasUsedTrial(feature)) {
+    consumeTrial(feature);
+    showToast('✓ Free trial used — this feature is now unlocked once.', 'success');
+    return true;
+  }
+  showPaywall(paywallTrigger || feature);
+  return false;
+}
+
+// ── STATE ──
+const state = {
+  violations: [],
+  disputes: [],
+  settings: {},
+  plan: 'free', // 'free' | 'paid'
+  currentViolationId: null,
+  currentDisputeViolationId: null,
+  currentTemplate: null,
+};
+
+// ── PERSISTENCE ──
+function save() {
+  localStorage.setItem('hoas_violations', JSON.stringify(state.violations));
+  localStorage.setItem('hoas_disputes', JSON.stringify(state.disputes));
+  localStorage.setItem('hoas_settings', JSON.stringify(state.settings));
+  localStorage.setItem('hoas_plan', state.plan);
+}
+
+function load() {
+  state.violations = JSON.parse(localStorage.getItem('hoas_violations') || '[]');
+  state.disputes = JSON.parse(localStorage.getItem('hoas_disputes') || '[]');
+  state.settings = JSON.parse(localStorage.getItem('hoas_settings') || '{}');
+  state.plan = localStorage.getItem('hoas_plan') || 'free';
+  // Check URL for Stripe success
+  if (new URLSearchParams(window.location.search).get('success') === '1') {
+    state.plan = 'paid';
+    save();
+    showToast('Welcome to Pro! All features unlocked. 🎉', 'success');
+    history.replaceState({}, '', '/');
+  }
+}
+
+// ── TRIAL STATUS UI HELPER ──
+// Shows a small indicator on gated features: "1 free use remaining" or "trial used"
+function trialLabel(feature) {
+  if (isPaid()) return '';
+  const used = hasUsedTrial(feature);
+  return used
+    ? `<span style="font-size:10px;padding:2px 7px;border-radius:4px;background:var(--accent-bg);color:var(--accent);font-weight:600;margin-left:6px">1 free use spent</span>`
+    : `<span style="font-size:10px;padding:2px 7px;border-radius:4px;background:var(--green-bg);color:var(--green);font-weight:600;margin-left:6px">1 free try</span>`;
+}
+
+// ── NAVIGATION ──
+function nav(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+
+  const pageEl = document.getElementById('page-' + page);
+  if (pageEl) pageEl.classList.add('active');
+
+  document.querySelectorAll('.nav-item').forEach(n => {
+    if (n.getAttribute('onclick') === `nav('${page}')`) n.classList.add('active');
+  });
+
+  const titles = {
+    dashboard: 'Dashboard',
+    violations: 'Violations',
+    disputes: 'Disputes',
+    documents: 'Document Vault',
+    letters: 'Letter Generator',
+    laws: 'State HOA Laws',
+    settings: 'Settings',
+    'violation-detail': 'Violation Detail',
+  };
+  document.getElementById('topbar-title').textContent = titles[page] || page;
+
+  const actionsMap = {
+    violations: `<button class="btn btn-primary" onclick="showAddViolation()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add Violation</button>`,
+    dashboard: `<button class="btn btn-primary" onclick="showAddViolation()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="14" height="14"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add Violation</button>`,
+  };
+  document.getElementById('topbar-actions').innerHTML = actionsMap[page] || '';
+
+  // Close sidebar on mobile
+  document.getElementById('sidebar').classList.remove('open');
+
+  if (page === 'dashboard') renderDashboard();
+  if (page === 'violations') renderViolations();
+  if (page === 'disputes') renderDisputes();
+  if (page === 'documents') renderDocuments();
+  if (page === 'letters') renderLetters();
+  if (page === 'laws') renderLaws();
+  if (page === 'settings') renderSettings();
+}
+
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+}
+
+// ── PLAN HELPERS ──
+function isPaid() { return state.plan === 'paid'; }
+function canAddViolation() { return isPaid() || state.violations.length < FREE_VIOLATION_LIMIT; }
+
+function updatePlanUI() {
+  const paid = isPaid();
+  document.getElementById('plan-dot').className = 'plan-dot' + (paid ? ' paid' : '');
+  document.getElementById('plan-name').textContent = paid ? 'Pro Plan' : 'Free Plan';
+
+  if (!paid) {
+    const trials = getTrials();
+    const used = TRIAL_FEATURES.filter(f => trials[f]).length;
+    const remaining = TRIAL_FEATURES.length - used;
+    document.getElementById('plan-label').textContent =
+      remaining > 0 ? `${remaining} free trial use${remaining === 1 ? '' : 's'} left` : 'All trials used — upgrade';
+  } else {
+    document.getElementById('plan-label').textContent = 'Unlimited access';
+  }
+
+  document.getElementById('upgrade-btn').className = 'upgrade-btn' + (paid ? ' hidden' : '');
+  document.getElementById('nav-violation-count').textContent = state.violations.length;
+}
+
+// ── DASHBOARD ──
+function renderDashboard() {
+  const open = state.violations.filter(v => v.status === 'open').length;
+  const disputed = state.violations.filter(v => v.status === 'disputed').length;
+  const resolved = state.violations.filter(v => v.status === 'resolved').length;
+  const totalFines = state.violations.reduce((s, v) => s + (parseFloat(v.fine) || 0), 0);
+
+  document.getElementById('stat-open').textContent = open;
+  document.getElementById('stat-disputed').textContent = disputed;
+  document.getElementById('stat-resolved').textContent = resolved;
+  document.getElementById('stat-fines').textContent = '$' + totalFines.toLocaleString();
+
+  // Greeting
+  const h = new Date().getHours();
+  const greet = h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+  const name = state.settings.name ? `, ${state.settings.name.split(' ')[0]}` : '';
+  document.getElementById('greeting').textContent = greet + name;
+
+  // Urgent
+  const now = new Date();
+  const urgent = state.violations.filter(v => {
+    if (!v.deadline || v.status === 'resolved') return false;
+    const days = Math.ceil((new Date(v.deadline) - now) / 86400000);
+    return days <= 7 && days >= 0;
+  }).sort((a, b) => new Date(a.deadline) - new Date(b.deadline));
+
+  const urgentEl = document.getElementById('urgent-list');
+  if (urgent.length === 0) {
+    urgentEl.innerHTML = '<div class="empty-state" style="padding:20px"><p>No urgent deadlines right now. Stay proactive.</p></div>';
+  } else {
+    urgentEl.innerHTML = urgent.map(v => {
+      const days = Math.ceil((new Date(v.deadline) - now) / 86400000);
+      return `<div class="violation-item" onclick="showDetail('${v.id}')">
+        <div class="v-status-dot ${v.status}"></div>
+        <div class="v-body">
+          <div class="v-title">${v.title}</div>
+          <div class="v-meta"><span>${v.type}</span><span class="v-fine">${v.fine ? '$' + v.fine : 'No fine stated'}</span></div>
+        </div>
+        <div class="v-right">
+          <div class="deadline-pill urgent">⚡ ${days === 0 ? 'Due today' : days + ' day' + (days === 1 ? '' : 's') + ' left'}</div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  // Recent
+  const recent = [...state.violations].sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 4);
+  const recentEl = document.getElementById('dash-recent');
+  if (recent.length === 0) {
+    recentEl.innerHTML = `<div class="empty-state" style="padding:30px 0">
+      <div class="empty-state-icon">🏡</div>
+      <h3>No violations logged yet</h3>
+      <p>When your HOA sends a violation notice, log it here immediately.</p>
+      <button class="btn btn-primary" onclick="showAddViolation()">Log first violation</button>
+    </div>`;
+  } else {
+    recentEl.innerHTML = recent.map(v => violationRow(v)).join('');
+  }
+}
+
+// ── VIOLATIONS ──
+function renderViolations() {
+  updatePlanUI();
+
+  // Show trial status bar on violations page
+  const trialUsed = hasUsedTrial('violation');
+  const limitBar = document.getElementById('free-limit-bar');
+  if (isPaid()) {
+    limitBar.style.display = 'none';
+  } else if (!trialUsed) {
+    limitBar.style.display = 'flex';
+    limitBar.innerHTML = `
+      <div class="limit-bar-text" style="color:var(--green)">
+        <strong>🎁 Free trial:</strong> You can add your first violation free — no payment needed.
+      </div>`;
+  } else {
+    limitBar.style.display = 'flex';
+    limitBar.innerHTML = `
+      <div class="limit-bar-text">
+        <strong>Free trial used.</strong> Upgrade to Pro to track unlimited violations.
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="showPaywall('limit')">Upgrade — $29/mo</button>`;
+  }
+
+  const listEl = document.getElementById('violations-list');
+  if (state.violations.length === 0) {
+    listEl.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">📋</div>
+      <h3>No violations yet</h3>
+      <p>Log your first HOA violation letter. Include the deadline — we'll track it for you.</p>
+      <button class="btn btn-primary" onclick="showAddViolation()">Add violation</button>
+    </div>`;
+    return;
+  }
+
+  const sorted = [...state.violations].sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
+  listEl.innerHTML = `<div class="card"><div class="card-body" style="padding:0 20px">${sorted.map(v => violationRow(v)).join('')}</div></div>`;
+}
+
+function violationRow(v) {
+  const deadlineHtml = deadlinePill(v.deadline, v.status);
+  return `<div class="violation-item" onclick="showDetail('${v.id}')">
+    <div class="v-status-dot ${v.status}"></div>
+    <div class="v-body">
+      <div class="v-title">${v.title}</div>
+      <div class="v-meta">
+        <span>${v.type || 'Other'}</span>
+        <span>${formatDate(v.dateReceived)}</span>
+        ${v.fine ? `<span class="v-fine">$${parseFloat(v.fine).toLocaleString()}</span>` : ''}
+      </div>
+    </div>
+    <div class="v-right">
+      ${deadlineHtml}
+      <div style="margin-top:4px"><span class="badge badge-${v.status}">${statusLabel(v.status)}</span></div>
+    </div>
+  </div>`;
+}
+
+function deadlinePill(deadline, status) {
+  if (!deadline || status === 'resolved') return `<div class="deadline-pill none">No deadline</div>`;
+  const days = Math.ceil((new Date(deadline) - new Date()) / 86400000);
+  if (days < 0) return `<div class="deadline-pill urgent">⚠ Overdue</div>`;
+  if (days === 0) return `<div class="deadline-pill urgent">⚡ Due today</div>`;
+  if (days <= 3) return `<div class="deadline-pill urgent">🔥 ${days}d left</div>`;
+  if (days <= 7) return `<div class="deadline-pill warn">⚡ ${days}d left</div>`;
+  return `<div class="deadline-pill ok">${days} days left</div>`;
+}
+
+function statusLabel(s) {
+  return { open: 'Open', disputed: 'Disputed', resolved: 'Resolved' }[s] || s;
+}
+
+// ── VIOLATION DETAIL ──
+function showDetail(id) {
+  state.currentViolationId = id;
+  const v = state.violations.find(x => x.id === id);
+  if (!v) return;
+
+  const dispute = state.disputes.find(d => d.violationId === id);
+  const photos = v.photos || [];
+
+  const el = document.getElementById('violation-detail-content');
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
+      <button class="btn btn-ghost btn-sm" onclick="nav('violations')">← Back</button>
+      <h2 class="section-heading" style="margin:0;flex:1">${v.title}</h2>
+      <span class="badge badge-${v.status}">${statusLabel(v.status)}</span>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px">
+      <div class="card" style="margin:0">
+        <div class="card-header"><div class="card-title">Violation info</div></div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:10px">
+          <div style="display:flex;justify-content:space-between;font-size:13px"><span style="color:var(--ink3)">Type</span><span>${v.type}</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:13px"><span style="color:var(--ink3)">Received</span><span>${formatDate(v.dateReceived)}</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:13px"><span style="color:var(--ink3)">Deadline</span><span>${v.deadline ? formatDate(v.deadline) : '—'}</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:13px"><span style="color:var(--ink3)">Fine</span><span style="color:var(--accent);font-weight:500">${v.fine ? '$' + parseFloat(v.fine).toLocaleString() : 'None stated'}</span></div>
+        </div>
+      </div>
+      <div class="card" style="margin:0">
+        <div class="card-header"><div class="card-title">Deadline status</div></div>
+        <div class="card-body" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100px">
+          ${v.deadline ? `<div style="font-family:var(--serif);font-size:40px;color:var(--ink)">${Math.max(0, Math.ceil((new Date(v.deadline) - new Date()) / 86400000))}</div><div style="font-size:12px;color:var(--ink3)">days remaining</div>` : '<div style="font-size:13px;color:var(--ink3)">No deadline set</div>'}
+        </div>
+      </div>
+    </div>
+
+    ${v.notes ? `<div class="card" style="margin-bottom:14px"><div class="card-header"><div class="card-title">Your notes</div></div><div class="card-body"><p style="font-size:14px;line-height:1.7;color:var(--ink2)">${v.notes}</p></div></div>` : ''}
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-header">
+        <div class="card-title">Photo evidence (${photos.length})</div>
+        ${isPaid() || photos.length < 5 ? `<button class="btn btn-secondary btn-sm" onclick="triggerPhotoUpload('${v.id}')">+ Add photo</button>` : `<button class="btn btn-secondary btn-sm" onclick="showPaywall('photos')">Upgrade for more</button>`}
+      </div>
+      <div class="card-body">
+        <input type="file" id="photo-input-${v.id}" accept="image/*" multiple style="display:none" onchange="handlePhotoUpload(event,'${v.id}')">
+        ${photos.length === 0 ? `<div style="text-align:center;padding:24px;color:var(--ink3);font-size:13px">No photos yet. Add photos to prove compliance.</div>` : `<div class="photo-grid">${photos.map((p, i) => `<div class="photo-thumb"><img src="${p.data}" alt="Evidence"><button class="remove-photo" onclick="removePhoto('${v.id}',${i})">✕</button></div>`).join('')}</div>`}
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-header">
+        <div class="card-title">Dispute</div>
+        ${!dispute ? `<button class="btn btn-primary btn-sm" onclick="showAddDispute('${v.id}')">Open dispute</button>` : ''}
+      </div>
+      <div class="card-body">
+        ${dispute ? renderDisputeDetail(dispute) : `<div style="text-align:center;padding:20px;color:var(--ink3);font-size:13px">No dispute opened yet. Generate a letter first, then open a dispute to track it.</div>`}
+      </div>
+    </div>
+
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px">
+      <button class="btn btn-primary" onclick="${isPaid() || !hasUsedTrial('letter') ? `nav('letters')` : `showPaywall('letter_from_detail')`}">
+        Generate dispute letter ${trialLabel('letter')}
+      </button>
+      <button class="btn btn-secondary" onclick="${isPaid() || !hasUsedTrial('pdf') ? `exportViolationPDF('${v.id}')` : `showPaywall('pdf')`}">
+        Export PDF record ${trialLabel('pdf')}
+      </button>
+      <select class="btn btn-secondary" style="cursor:pointer" onchange="updateStatus('${v.id}', this.value)">
+        <option value="">Change status…</option>
+        <option value="open">Open</option>
+        <option value="disputed">Disputed</option>
+        <option value="resolved">Resolved</option>
+      </select>
+      <button class="btn btn-danger btn-sm" onclick="deleteViolation('${v.id}')">Delete</button>
+    </div>
+  `;
+
+  nav('violation-detail');
+}
+
+function renderDisputeDetail(d) {
+  const steps = ['pending', 'board_responded', 'hearing_scheduled', 'escalated', 'won'];
+  const stepLabels = ['Submitted', 'Response', 'Hearing', 'Escalated', 'Outcome'];
+  const idx = steps.indexOf(d.status);
+  return `
+    <div class="dispute-steps">
+      ${stepLabels.map((l, i) => `<div class="dstep ${i < idx ? 'done' : i === idx ? 'active' : ''}">${l}</div>`).join('')}
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px;font-size:13px">
+      <div style="display:flex;justify-content:space-between"><span style="color:var(--ink3)">Submitted</span><span>${d.submittedDate ? formatDate(d.submittedDate) : '—'}</span></div>
+      <div style="display:flex;justify-content:space-between"><span style="color:var(--ink3)">Board response</span><span>${d.boardResponse ? formatDate(d.boardResponse) : 'Pending'}</span></div>
+      <div style="display:flex;justify-content:space-between"><span style="color:var(--ink3)">Next hearing</span><span>${d.nextHearing ? formatDate(d.nextHearing) : '—'}</span></div>
+      ${d.notes ? `<div style="margin-top:8px;padding:10px;background:var(--bg);border-radius:6px;color:var(--ink2)">${d.notes}</div>` : ''}
+    </div>
+  `;
+}
+
+// ── DISPUTES PAGE ──
+function renderDisputes() {
+  const listEl = document.getElementById('disputes-list');
+  if (state.disputes.length === 0) {
+    listEl.innerHTML = `<div class="empty-state"><div class="empty-state-icon">⚖️</div><h3>No active disputes</h3><p>Start a dispute from any violation's detail page.</p></div>`;
+    return;
+  }
+  listEl.innerHTML = state.disputes.map(d => {
+    const v = state.violations.find(x => x.id === d.violationId);
+    return `<div class="card">
+      <div class="card-header">
+        <div class="card-title">${v ? v.title : 'Unknown violation'}</div>
+        <span class="badge badge-${d.status === 'won' ? 'resolved' : d.status === 'pending' ? 'open' : 'disputed'}">${d.status.replace('_', ' ')}</span>
+      </div>
+      <div class="card-body">${renderDisputeDetail(d)}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── DOCUMENTS ──
+function renderDocuments() {
+  const all = state.violations.flatMap(v => (v.photos || []).map(p => ({ ...p, vTitle: v.title, vId: v.id })));
+  const el = document.getElementById('documents-grid');
+  if (all.length === 0) {
+    el.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="empty-state-icon">📁</div><h3>No documents yet</h3><p>Attach photos to your violations and they'll appear here.</p></div>`;
+    return;
+  }
+  el.innerHTML = all.map(p => `
+    <div onclick="showDetail('${p.vId}')" style="cursor:pointer">
+      <div style="aspect-ratio:1;border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border2);margin-bottom:6px">
+        <img src="${p.data}" style="width:100%;height:100%;object-fit:cover">
+      </div>
+      <div style="font-size:12px;color:var(--ink3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.vTitle}</div>
+    </div>
+  `).join('');
+}
+
+// ── PHOTOS ──
+function triggerPhotoUpload(vId) {
+  document.getElementById('photo-input-' + vId).click();
+}
+
+function handlePhotoUpload(event, vId) {
+  const files = Array.from(event.target.files);
+  const v = state.violations.find(x => x.id === vId);
+  if (!v) return;
+  if (!v.photos) v.photos = [];
+
+  // Free users get 5 photos on first violation (trial). After that → paywall.
+  const freePhotoLimit = 5;
+  if (!isPaid() && v.photos.length >= freePhotoLimit) {
+    if (hasUsedTrial('photo_extra')) {
+      showPaywall('photos');
+      return;
+    }
+    consumeTrial('photo_extra');
+  }
+
+  let loaded = 0;
+  files.forEach(file => {
+    if (!isPaid() && v.photos.length >= freePhotoLimit) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      v.photos.push({ data: e.target.result, caption: file.name });
+      loaded++;
+      if (loaded === files.length) {
+        save();
+        showDetail(vId);
+        showToast('Photos added ✓', 'success');
+      }
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function removePhoto(vId, idx) {
+  const v = state.violations.find(x => x.id === vId);
+  if (!v || !v.photos) return;
+  v.photos.splice(idx, 1);
+  save();
+  showDetail(vId);
+}
+
+// ── SAVE / ADD VIOLATION ──
+function showAddViolation() {
+  if (!isPaid() && hasUsedTrial('violation')) {
+    showPaywall('limit');
+    return;
+  }
+  document.getElementById('v-title').value = '';
+  document.getElementById('v-type').value = '';
+  document.getElementById('v-fine').value = '';
+  document.getElementById('v-date').value = new Date().toISOString().split('T')[0];
+  document.getElementById('v-deadline').value = '';
+  document.getElementById('v-notes').value = '';
+  openModal('modal-add-violation');
+}
+
+function saveViolation() {
+  const title = document.getElementById('v-title').value.trim();
+  const type = document.getElementById('v-type').value;
+  const date = document.getElementById('v-date').value;
+  if (!title || !type || !date) { showToast('Please fill in title, type, and date.', 'error'); return; }
+
+  if (!isPaid() && hasUsedTrial('violation')) {
+    closeModal('modal-add-violation');
+    showPaywall('limit');
+    return;
+  }
+
+  // Consume trial on first save (if not paid)
+  if (!isPaid()) consumeTrial('violation');
+
+  const v = {
+    id: uid(),
+    title,
+    type,
+    fine: document.getElementById('v-fine').value,
+    dateReceived: date,
+    deadline: document.getElementById('v-deadline').value,
+    notes: document.getElementById('v-notes').value.trim(),
+    status: 'open',
+    photos: [],
+    createdAt: new Date().toISOString(),
+  };
+
+  state.violations.push(v);
+  save();
+  closeModal('modal-add-violation');
+  showToast('Violation logged ✓', 'success');
+  updatePlanUI();
+  renderViolations();
+  renderDashboard();
+}
+
+function deleteViolation(id) {
+  if (!confirm('Delete this violation? This cannot be undone.')) return;
+  state.violations = state.violations.filter(v => v.id !== id);
+  state.disputes = state.disputes.filter(d => d.violationId !== id);
+  save();
+  showToast('Violation deleted');
+  nav('violations');
+}
+
+function updateStatus(id, status) {
+  if (!status) return;
+  const v = state.violations.find(x => x.id === id);
+  if (v) { v.status = status; save(); showDetail(id); showToast('Status updated ✓', 'success'); }
+}
+
+// ── DISPUTE ──
+function showAddDispute(vId) {
+  state.currentDisputeViolationId = vId;
+  document.getElementById('d-submitted').value = new Date().toISOString().split('T')[0];
+  document.getElementById('d-response').value = '';
+  document.getElementById('d-hearing').value = '';
+  document.getElementById('d-status').value = 'pending';
+  document.getElementById('d-notes').value = '';
+  openModal('modal-add-dispute');
+}
+
+function saveDispute() {
+  if (!isPaid() && hasUsedTrial('dispute')) {
+    closeModal('modal-add-dispute');
+    showPaywall('dispute');
+    return;
+  }
+  if (!isPaid()) consumeTrial('dispute');
+
+  const vId = state.currentDisputeViolationId;
+  const existing = state.disputes.find(d => d.violationId === vId);
+  const d = {
+    id: existing ? existing.id : uid(),
+    violationId: vId,
+    submittedDate: document.getElementById('d-submitted').value,
+    boardResponse: document.getElementById('d-response').value,
+    nextHearing: document.getElementById('d-hearing').value,
+    status: document.getElementById('d-status').value,
+    notes: document.getElementById('d-notes').value.trim(),
+    createdAt: existing ? existing.createdAt : new Date().toISOString(),
+  };
+
+  if (existing) {
+    state.disputes = state.disputes.map(x => x.id === d.id ? d : x);
+  } else {
+    state.disputes.push(d);
+    const v = state.violations.find(x => x.id === vId);
+    if (v) { v.status = 'disputed'; }
+  }
+
+  save();
+  closeModal('modal-add-dispute');
+  showToast('Dispute saved ✓', 'success');
+  showDetail(vId);
+}
+
+// ── LETTER GENERATOR ──
+const TEMPLATES = [
+  { id: 'dispute_fine', title: 'Dispute a fine', desc: 'Formally contest a fine you believe is unjust or incorrect.' },
+  { id: 'compliance_proof', title: 'Proof of compliance', desc: 'Notify the HOA you have corrected the cited violation.' },
+  { id: 'request_evidence', title: 'Request evidence', desc: 'Ask the HOA to provide the evidence behind their violation claim.' },
+  { id: 'appeal_hearing', title: 'Request a hearing', desc: 'Formally request a board hearing to appeal a fine or violation.' },
+  { id: 'cease_harassment', title: 'Cease & desist selective enforcement', desc: 'When the HOA enforces rules against you but ignores others.' },
+  { id: 'records_request', title: 'HOA records request', desc: 'Request copies of relevant HOA meeting minutes and communications.' },
+  { id: 'extension_request', title: 'Request deadline extension', desc: 'Ask for more time to cure a violation or respond to a fine.' },
+  { id: 'fine_waiver', title: 'Fine waiver request', desc: 'Request the board waive a first-time or minor fine.' },
+];
+
+function renderLetters() {
+  const grid = document.getElementById('template-grid');
+  grid.innerHTML = TEMPLATES.map(t => `
+    <div class="template-card ${state.currentTemplate === t.id ? 'selected' : ''}" onclick="selectTemplate('${t.id}')">
+      <h4>${t.title}</h4>
+      <p>${t.desc}</p>
+    </div>
+  `).join('');
+}
+
+function selectTemplate(id) {
+  if (!isPaid() && hasUsedTrial('letter')) {
+    showPaywall('letter');
+    return;
+  }
+  if (!isPaid()) consumeTrial('letter');
+  state.currentTemplate = id;
+  document.getElementById('letter-form-card').style.display = 'block';
+  document.getElementById('letter-output-card').style.display = 'none';
+  // Pre-fill from settings
+  document.getElementById('letter-name').value = state.settings.name || '';
+  document.getElementById('letter-address').value = state.settings.address || '';
+  document.getElementById('letter-hoa').value = state.settings.hoa || '';
+  document.getElementById('letter-date').value = new Date().toISOString().split('T')[0];
+  renderLetters();
+  document.getElementById('letter-form-card').scrollIntoView({ behavior: 'smooth' });
+}
+
+function generateLetter() {
+  const name = document.getElementById('letter-name').value.trim();
+  const address = document.getElementById('letter-address').value.trim();
+  const hoa = document.getElementById('letter-hoa').value.trim();
+  const violation = document.getElementById('letter-violation').value.trim();
+  const date = document.getElementById('letter-date').value;
+  const fine = document.getElementById('letter-fine').value.trim();
+  const situation = document.getElementById('letter-situation').value.trim();
+
+  if (!name || !address || !hoa) { showToast('Please fill in your name, address, and HOA name.', 'error'); return; }
+
+  const today = formatDate(new Date().toISOString().split('T')[0]);
+  const tmpl = TEMPLATES.find(t => t.id === state.currentTemplate);
+  let letter = '';
+
+  const header = `${name}
+${address}
+${today}
+
+${hoa} Board of Directors
+Re: ${tmpl ? tmpl.title : 'Formal Correspondence'}
+Violation referenced: ${violation || 'As cited in notice dated ' + formatDate(date)}
+${fine ? `Fine amount: ${fine}` : ''}
+
+Dear Members of the Board,`;
+
+  const footer = `\n\nI expect a written response within 10 business days. I am keeping a complete record of all correspondence, dates, and evidence related to this matter.
+
+Respectfully submitted,
+
+${name}
+${address}
+Date: ${today}`;
+
+  const bodies = {
+    dispute_fine: `\n\nI am writing to formally dispute the violation notice and associated fine of ${fine || '[amount]'} issued on ${formatDate(date)}.
+
+${situation}
+
+After careful review of the CC&Rs and applicable state law, I believe this fine is not warranted for the following reasons:
+
+1. The cited violation does not accurately describe the condition of my property.
+2. I have photographic documentation demonstrating compliance as of the date of the alleged violation.
+3. The fine amount appears to exceed the schedule outlined in the community governing documents.
+
+I respectfully request that the Board immediately rescind this fine and remove any record of this violation from my homeowner file. I am happy to provide all supporting documentation at a board hearing if required.`,
+
+    compliance_proof: `\n\nI am writing to notify the Board that I have fully remedied the violation cited in your notice dated ${formatDate(date)}.
+
+${situation}
+
+The corrective action was completed on [date of correction]. I have photographic documentation confirming compliance, which I am prepared to submit upon request.
+
+I respectfully request that you update your records to reflect that this matter has been resolved and that no further fines be assessed in connection with this violation.`,
+
+    request_evidence: `\n\nI am writing to formally request the evidence relied upon in issuing the violation notice dated ${formatDate(date)}.
+
+${situation}
+
+Pursuant to my rights under the governing documents and applicable state law, I request that the Board provide the following within 10 business days:
+
+1. The date, time, and location of the alleged violation observation
+2. The name or role of the person who identified the violation
+3. Any photographs, videos, or written reports documenting the alleged violation
+4. The specific section of the CC&Rs or Rules & Regulations alleged to have been violated
+
+I cannot meaningfully respond to or cure a violation without this information. I reserve all rights pending receipt of this documentation.`,
+
+    appeal_hearing: `\n\nI am writing to formally request a hearing before the Board of Directors to appeal the violation notice and fine issued on ${formatDate(date)}.
+
+${situation}
+
+I believe I have sufficient evidence and grounds to demonstrate that this violation was either not committed, has been fully remedied, or that the fine is disproportionate to the alleged infraction. I am prepared to present documentation and testimony at the hearing.
+
+Please provide me with at least 10 days advance notice of the scheduled hearing date. I am available on most weekday evenings and weekends.`,
+
+    cease_harassment: `\n\nI am writing to formally notify the Board that I believe I am being subjected to selective enforcement of the community's rules and regulations, which I understand to be prohibited under both our governing documents and applicable state law.
+
+${situation}
+
+I have observed that similar or identical conditions exist at multiple other properties within the community, none of which have received violation notices. Selective enforcement — targeting one homeowner while ignoring others in similar circumstances — is legally impermissible and exposes the association to liability.
+
+I respectfully demand that the Board immediately cease issuing violation notices to my property unless the same rules are consistently enforced community-wide. I am retaining documentation of all incidents and reserve all legal rights.`,
+
+    records_request: `\n\nPursuant to my rights as a homeowner under the governing documents and applicable state law, I am writing to formally request copies of the following association records:
+
+1. All meeting minutes from the past 12 months related to enforcement decisions
+2. All correspondence sent to or received by the Board regarding my property
+3. The complete violation history for my address on file with the association
+4. The current fine schedule as adopted by the Board
+
+Please provide these records within the time period required by law. I am happy to pay reasonable copying costs. If any records are withheld, please identify the specific legal basis for withholding each document.`,
+
+    extension_request: `\n\nI am writing to respectfully request an extension of the response deadline stated in the violation notice dated ${formatDate(date)}.
+
+${situation}
+
+Due to [circumstances — illness, travel, contractor availability, etc.], I have not been able to complete the required corrective action by the stated deadline. I am actively working to resolve this matter and request an additional [15/30] days to achieve full compliance.
+
+I am committed to resolving this issue as quickly as possible and appreciate the Board's consideration of this reasonable request.`,
+
+    fine_waiver: `\n\nI am writing to respectfully request that the Board consider waiving the fine of ${fine || '[amount]'} associated with the violation notice dated ${formatDate(date)}.
+
+${situation}
+
+This is the first violation notice I have received in my [X] years as a resident of this community. I have been a cooperative and compliant homeowner and take my responsibilities under the governing documents seriously. The violation, [description], has been fully corrected as of [correction date].
+
+Given my record of compliance and the fact that this situation has been fully remedied, I respectfully ask that the Board exercise its discretion to waive this fine as a one-time accommodation. I appreciate the Board's consideration.`,
+  };
+
+  letter = header + (bodies[state.currentTemplate] || '\n\n[Letter body]') + footer;
+  document.getElementById('letter-preview').textContent = letter;
+  document.getElementById('letter-output-card').style.display = 'block';
+  document.getElementById('letter-output-card').scrollIntoView({ behavior: 'smooth' });
+}
+
+function copyLetter() {
+  const text = document.getElementById('letter-preview').textContent;
+  navigator.clipboard.writeText(text).then(() => showToast('Copied to clipboard ✓', 'success'));
+}
+
+function downloadLetterPDF() {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+  const text = document.getElementById('letter-preview').textContent;
+  const lines = doc.splitTextToSize(text, 170);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  doc.text(lines, 20, 20);
+  doc.save('HOA-Dispute-Letter.pdf');
+  showToast('PDF downloaded ✓', 'success');
+}
+
+// ── VIOLATION PDF EXPORT ──
+function exportViolationPDF(id) {
+  if (!isPaid() && hasUsedTrial('pdf')) {
+    showPaywall('pdf');
+    return;
+  }
+  if (!isPaid()) consumeTrial('pdf');
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+  const v = state.violations.find(x => x.id === id);
+  if (!v) return;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(16);
+  doc.text('HOAShield — Violation Record', 20, 20);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  doc.text(`Generated: ${new Date().toLocaleDateString()}`, 20, 30);
+  doc.line(20, 34, 190, 34);
+
+  let y = 44;
+  const row = (label, val) => {
+    doc.setFont('helvetica', 'bold'); doc.text(label + ':', 20, y);
+    doc.setFont('helvetica', 'normal'); doc.text(String(val || '—'), 70, y);
+    y += 8;
+  };
+
+  row('Violation title', v.title);
+  row('Type', v.type);
+  row('Date received', formatDate(v.dateReceived));
+  row('Response deadline', v.deadline ? formatDate(v.deadline) : 'None');
+  row('Fine amount', v.fine ? '$' + v.fine : 'None stated');
+  row('Status', statusLabel(v.status));
+  y += 4;
+
+  if (v.notes) {
+    doc.setFont('helvetica', 'bold'); doc.text('Notes:', 20, y); y += 6;
+    doc.setFont('helvetica', 'normal');
+    const noteLines = doc.splitTextToSize(v.notes, 170);
+    doc.text(noteLines, 20, y); y += noteLines.length * 6 + 4;
+  }
+
+  const dispute = state.disputes.find(d => d.violationId === id);
+  if (dispute) {
+    y += 4;
+    doc.setFont('helvetica', 'bold'); doc.text('Dispute record:', 20, y); y += 8;
+    row('Submitted', formatDate(dispute.submittedDate));
+    row('Status', dispute.status.replace('_', ' '));
+    if (dispute.notes) {
+      const dLines = doc.splitTextToSize(dispute.notes, 170);
+      doc.text(dLines, 20, y); y += dLines.length * 6;
+    }
+  }
+
+  doc.save(`HOA-Violation-Record-${v.title.replace(/\s+/g,'-')}.pdf`);
+  showToast('PDF exported ✓', 'success');
+}
+
+// ── STATE LAWS ──
+const STATE_LAWS = [
+  { state: 'Arizona', code: 'AZ', noticePeriod: '10 days written notice before fine', fineCap: 'Reasonable amount per CC&Rs', hearingRight: 'Yes — right to a hearing before fine imposed', lienThreshold: '$1,200 or 1 year of assessments', notes: 'ARS § 33-1803 prohibits HOA from fining without prior notice and hearing opportunity.' },
+  { state: 'California', code: 'CA', noticePeriod: '10 days before fine or hearing', fineCap: 'Set by board, must be "reasonable"', hearingRight: 'Yes — IDR (Internal Dispute Resolution) required first', lienThreshold: '$1,800 or 12 months delinquent', notes: 'Davis-Stirling Act (Civil Code §4900+) is one of the strongest homeowner protection frameworks.' },
+  { state: 'Florida', code: 'FL', noticePeriod: '14 days written notice', fineCap: '$100/day, $1,000 maximum per violation', hearingRight: 'Yes — fining committee (not the board) must approve fines', lienThreshold: '$1,000', notes: 'FL § 720.305: fines must be approved by a separate fining committee, not just the board.' },
+  { state: 'Texas', code: 'TX', noticePeriod: 'Reasonable notice per CC&Rs', fineCap: 'Per CC&Rs — no statutory cap', hearingRight: 'Per CC&Rs', lienThreshold: '$2,000 or 12 months of assessments', notes: 'TX Property Code Ch. 204: HOAs must make governing docs available and hold annual meetings.' },
+  { state: 'Nevada', code: 'NV', noticePeriod: '30 days to cure before fine', fineCap: '$100/day up to $1,000', hearingRight: 'Yes — mandatory before fine imposed', lienThreshold: '$1,000 + attorney fees', notes: 'NRS Chapter 116: Nevada has very strong homeowner protections; HOAs must follow strict notice procedures.' },
+  { state: 'Georgia', code: 'GA', noticePeriod: 'Per CC&Rs — no statutory minimum', fineCap: 'Per CC&Rs', hearingRight: 'Per CC&Rs', lienThreshold: '$2,000', notes: 'Georgia HOA Act (OCGA § 44-3-220+): applies only to HOAs formed after 1994.' },
+  { state: 'North Carolina', code: 'NC', noticePeriod: '15 days written notice', fineCap: 'Per CC&Rs; must be reasonable', hearingRight: 'Yes — right to a hearing within 30 days of request', lienThreshold: '$2,500 or 12 months', notes: 'NC § 47F-3-107.1: homeowners have a right to a hearing before the board.' },
+  { state: 'Colorado', code: 'CO', noticePeriod: '30 days written notice to cure', fineCap: '$500 maximum per violation (CCIOA)', hearingRight: 'Yes — mandatory hearing process', lienThreshold: '$300 + 6 months delinquent assessments', notes: 'CCIOA (§ 38-33.3): one of the most comprehensive HOA laws. HOAs must have a fine policy in writing.' },
+  { state: 'Illinois', code: 'IL', noticePeriod: 'Reasonable notice per governing docs', fineCap: 'Per CC&Rs', hearingRight: 'Per CC&Rs', lienThreshold: '$5,000 or 12 months delinquent', notes: 'Common Interest Community Association Act (765 ILCS 160) applies to most Illinois HOAs.' },
+  { state: 'Washington', code: 'WA', noticePeriod: '21 days to cure before fine', fineCap: 'Per CC&Rs; must be reasonable', hearingRight: 'Yes — right to hearing within 10 days of request', lienThreshold: '$2,000', notes: 'Washington Uniform Common Interest Ownership Act (RCW 64.90): strong protections since 2018.' },
+];
+
+function renderLaws() {
+  const filter = document.getElementById('law-state-filter').value;
+  const stateSelect = document.getElementById('law-state-filter');
+  if (stateSelect.options.length === 1) {
+    STATE_LAWS.forEach(l => {
+      const opt = document.createElement('option');
+      opt.value = l.code; opt.textContent = l.state;
+      stateSelect.appendChild(opt);
+    });
+  }
+
+  const list = filter ? STATE_LAWS.filter(l => l.code === filter) : STATE_LAWS;
+  document.getElementById('laws-list').innerHTML = list.map(l => `
+    <div class="state-law-card">
+      <div class="state-law-header">
+        <span style="font-size:18px">${getFlagEmoji(l.code)}</span>
+        <div class="state-law-name">${l.state}</div>
+      </div>
+      <div class="law-items">
+        <div class="law-item"><div class="law-key">Notice required</div><div class="law-val">${l.noticePeriod}</div></div>
+        <div class="law-item"><div class="law-key">Fine cap</div><div class="law-val">${l.fineCap}</div></div>
+        <div class="law-item"><div class="law-key">Hearing right</div><div class="law-val">${l.hearingRight}</div></div>
+        <div class="law-item"><div class="law-key">Lien threshold</div><div class="law-val">${l.lienThreshold}</div></div>
+        <div class="law-item"><div class="law-key">Key note</div><div class="law-val" style="color:var(--ink3)">${l.notes}</div></div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function getFlagEmoji(code) {
+  const flags = { AZ:'🏜️',CA:'🌴',FL:'☀️',TX:'⭐',NV:'🎰',GA:'🍑',NC:'🌲',CO:'🏔️',IL:'🌆',WA:'🌧️' };
+  return flags[code] || '🏛️';
+}
+
+// ── SETTINGS ──
+function renderSettings() {
+  document.getElementById('setting-name').value = state.settings.name || '';
+  document.getElementById('setting-hoa').value = state.settings.hoa || '';
+  document.getElementById('setting-address').value = state.settings.address || '';
+
+  const stateSelect = document.getElementById('setting-state');
+  if (stateSelect.options.length === 1) {
+    STATE_LAWS.forEach(l => {
+      const opt = document.createElement('option');
+      opt.value = l.code; opt.textContent = l.state;
+      stateSelect.appendChild(opt);
+    });
+  }
+  stateSelect.value = state.settings.state || '';
+
+  const paid = isPaid();
+  document.getElementById('settings-plan-name').textContent = paid ? 'Pro' : 'Free (with trials)';
+
+  if (!paid) {
+    const trials = getTrials();
+    const lines = TRIAL_FEATURES.map(f => {
+      const used = !!trials[f];
+      const labels = { violation: 'Add violation', letter: 'Generate letter', pdf: 'Export PDF', dispute: 'Open dispute', photo_extra: 'Extra photos' };
+      return `<div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;border-bottom:1px solid var(--border2)">
+        <span style="color:var(--ink2)">${labels[f]}</span>
+        <span style="${used ? 'color:var(--accent)' : 'color:var(--green)'};font-weight:500">${used ? '✗ Trial used' : '✓ 1 free try available'}</span>
+      </div>`;
+    }).join('');
+    document.getElementById('settings-plan-desc').innerHTML = `
+      <div style="margin-bottom:10px;color:var(--ink3);font-size:13px">Each feature gets one free try. After that, upgrade to Pro for unlimited access.</div>
+      ${lines}`;
+  } else {
+    document.getElementById('settings-plan-desc').textContent = 'Full access — unlimited violations, all tools.';
+  }
+
+  const upgradeBtn = document.getElementById('settings-upgrade-btn');
+  upgradeBtn.style.display = paid ? 'none' : 'inline-flex';
+}
+
+function saveSettings() {
+  state.settings.name = document.getElementById('setting-name').value.trim();
+  state.settings.hoa = document.getElementById('setting-hoa').value.trim();
+  state.settings.address = document.getElementById('setting-address').value.trim();
+  state.settings.state = document.getElementById('setting-state').value;
+  save();
+  showToast('Settings saved ✓', 'success');
+}
+
+// ── PAYWALL ──
+const paywallMessages = {
+  limit: 'You\'ve used your one free violation log. Upgrade to Pro to track unlimited violations — every new notice deserves documentation.',
+  letter: 'You\'ve used your one free letter. Upgrade to Pro for all 8 dispute letter templates, usable anytime.',
+  letter_from_detail: 'You\'ve used your one free letter. Upgrade to Pro to generate unlimited dispute letters.',
+  pdf: 'You\'ve used your one free PDF export. Upgrade to Pro to export your full violation record anytime — essential for attorney meetings and board hearings.',
+  photos: 'You\'ve used your free photo allowance. Upgrade to Pro for unlimited evidence storage.',
+  dispute: 'You\'ve used your one free dispute. Upgrade to Pro to track unlimited disputes and their outcomes.',
+  sidebar: 'Your free trial is spent. Upgrade to Pro — unlimited violations, all letter templates, PDF export, and more.',
+  settings: 'Upgrade to Pro to unlock all HOAShield features without limits.',
+};
+
+function showPaywall(trigger) {
+  const msg = paywallMessages[trigger] || 'Upgrade to Pro for full access.';
+  document.getElementById('paywall-message').textContent = msg;
+  document.getElementById('paywall').classList.add('show');
+}
+
+function closePaywall() {
+  document.getElementById('paywall').classList.remove('show');
+}
+
+async function startCheckout() {
+  // ── STRIPE CHECKOUT ──
+  // Replace with your actual Stripe publishable key and price ID above.
+  // In your Cloudflare Worker (/functions/api/stripe/checkout.js):
+  //   1. Receive POST request
+  //   2. Create Stripe Checkout session with your price ID
+  //   3. Return { url: session.url }
+  //   4. Redirect user to session.url
+  // On success, Stripe redirects to ?success=1 which this app detects.
+  //
+  // For now, show a placeholder:
+  showToast('Connect Stripe: replace STRIPE_KEY + STRIPE_PRICE_ID at top of file', 'error');
+
+  // PRODUCTION CODE (uncomment when Stripe keys are set):
+  // try {
+  //   const res = await fetch('/api/stripe/checkout', {
+  //     method: 'POST',
+  //     headers: { 'Content-Type': 'application/json' },
+  //     body: JSON.stringify({ priceId: STRIPE_PRICE_ID, successUrl: window.location.origin + '?success=1', cancelUrl: window.location.origin })
+  //   });
+  //   const { url } = await res.json();
+  //   window.location.href = url;
+  // } catch(e) {
+  //   showToast('Could not start checkout. Please try again.', 'error');
+  // }
+}
+
+// ── DATA EXPORT / CLEAR ──
+function exportData() {
+  const data = JSON.stringify({ violations: state.violations, disputes: state.disputes, settings: state.settings }, null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'hoashield-backup.json';
+  a.click();
+  showToast('Data exported ✓', 'success');
+}
+
+function confirmClearData() {
+  if (!confirm('Clear ALL your data? This cannot be undone.')) return;
+  localStorage.clear();
+  state.violations = [];
+  state.disputes = [];
+  state.settings = {};
+  state.plan = 'free';
+  renderDashboard();
+  updatePlanUI();
+  showToast('All data cleared');
+}
+
+// ── MODAL HELPERS ──
+function openModal(id) { document.getElementById(id).classList.add('show'); }
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+
+// Close modals on backdrop click
+document.querySelectorAll('.modal-overlay').forEach(el => {
+  el.addEventListener('click', e => { if (e.target === el) el.classList.remove('show'); });
+});
+document.getElementById('paywall').addEventListener('click', e => {
+  if (e.target === document.getElementById('paywall')) closePaywall();
+});
+
+// ── TOAST ──
+let toastTimer;
+function showToast(msg, type = '') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + type;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = '', 3000);
+}
+
+// ── UTILS ──
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
+function formatDate(str) {
+  if (!str) return '—';
+  const d = new Date(str + 'T12:00:00');
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// ── INIT ──
+load();
+updatePlanUI();
+renderDashboard();
+renderLetters();
+
+// Set today's date in add form
+document.getElementById('v-date').value = new Date().toISOString().split('T')[0];
+</script>
+</body>
+</html>
